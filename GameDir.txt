@@ -1,0 +1,14 @@
+# Where the game files are.
+#
+# The compiler and the game files are separate repositories, so this is how one finds the other. Point it
+# at your clone of the game repository - the folder holding Mods\lambda and LambdaEngine\Binaries\Win64,
+# which is where Build.bat puts LambdaBSP.exe and where Compile.bat runs it from.
+#
+# It is the same file, and the same path, as the one beside the engine's .uproject.
+#
+# A GAME_DIR set in the environment wins over it, so one build can be pointed elsewhere without editing
+# this.
+#
+# One path, absolute, with or without quotes. Lines starting with # are ignored, as are blank ones.
+
+C:\Users\Admin\Development\Misc\LambdaEngine\lambda-engine
