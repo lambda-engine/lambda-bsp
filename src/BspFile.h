@@ -141,6 +141,23 @@ struct dmodel_t
 };
 static_assert(sizeof(dmodel_t) == 48, "dmodel_t size");
 
+// LUMP_LEAFS version 1: Episode One and newer, with the ambient light cube moved out to its own lump.
+struct dleaf_t
+{
+	int32_t contents = 0;			// OR of all the brushes in the leaf
+	int16_t cluster = -1;
+	int16_t areaFlags = 0;			// area:9, flags:7
+	int16_t mins[3] = { 0, 0, 0 };
+	int16_t maxs[3] = { 0, 0, 0 };
+	uint16_t firstleafface = 0;
+	uint16_t numleaffaces = 0;
+	uint16_t firstleafbrush = 0;
+	uint16_t numleafbrushes = 0;
+	int16_t leafWaterDataID = -1;
+	int16_t pad = 0;
+};
+static_assert(sizeof(dleaf_t) == 32, "dleaf_t size");
+
 struct dbrushside_t
 {
 	uint16_t planenum = 0;

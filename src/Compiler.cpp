@@ -425,6 +425,10 @@ struct LumpBuilder
 	std::vector<int32_t> texdataStringTable;
 	std::string texdataStringData;
 	std::vector<dmodel_t> models;
+	std::vector<dbrush_t> brushes;
+	std::vector<dbrushside_t> brushsides;
+	std::vector<uint16_t> leafbrushes;
+	std::vector<dleaf_t> leafs;
 
 	std::unordered_map<uint64_t, int> vertexLookup;
 	std::map<std::pair<int, int>, int> edgeLookup;
@@ -435,6 +439,11 @@ struct LumpBuilder
 		// Edge 0 is never used: a face refers to an edge by a signed index, and there is no negative zero to
 		// spell "this edge, backwards".
 		edges.push_back(dedge_t());
+		// Leaf 0 is never used either (BeginBSPFile): a node's child is stored as -(leaf + 1), so a headnode
+		// of -1 has to mean something, and vbsp makes it a solid leaf with nothing in it.
+		dleaf_t errorLeaf;
+		errorLeaf.contents = CONTENTS_SOLID;
+		leafs.push_back(errorLeaf);
 	}
 
 	static Vec3 SnapVertex(Vec3 v)
@@ -624,7 +633,127 @@ void EmitFace(LumpBuilder& out, const Winding& w, int planenum, int texinfo)
  * rotates and moves it about. A door compiled in world coordinates swings around a point somewhere else in
  * the level.
  */
-dmodel_t EmitModel(LumpBuilder& out, std::vector<Brush>& brushes, const PlanePool& planes,
+/**
+ * The brushes of one model, and the leaf that says they belong to it.
+ *
+ * A brush is the shape; the faces are only its skin. An engine that wants to know whether something is inside
+ * a brush entity - which is the whole job of a trigger - has to have the brushes, and reaches them the way the
+ * format intends: model -> headnode -> leaf -> leafbrushes.
+ *
+ * There is no BSP tree here to hang the leaf off, so the model's headnode is the leaf itself. That is a legal
+ * degenerate tree (a child index is negative for a leaf, and the head node may be one) and it says exactly what
+ * is true: these brushes, no subdivision. vis and lighting are the things a real tree buys, and LambdaBSP does
+ * neither.
+ */
+void EmitModelBrushes(LumpBuilder& out, std::vector<Brush>& brushes, PlanePool& planes,
+	MaterialCache& materials, const Vec3& origin, dmodel_t& model)
+{
+	dleaf_t leaf;
+	leaf.cluster = -1;			// submodels have no cluster, and neither has a world with no tree to cluster
+	leaf.firstleafbrush = (uint16_t)out.leafbrushes.size();
+
+	Bounds bounds;
+	for (Brush& brush : brushes)
+	{
+		if (brush.bIsOrigin)
+		{
+			continue;
+		}
+		dbrush_t db;
+		db.contents = brush.contents;
+		db.firstside = (int32_t)out.brushsides.size();
+		db.numsides = 0;
+
+		// Every side, not just the ones that survived CSG: a side chopped away by a neighbour has stopped
+		// being visible, but it has not stopped being one of the planes that bound the brush.
+		for (const Side& side : brush.sides)
+		{
+			// CMapFile::LoadEntityCallback: an entity's geometry is moved to sit around its own origin by
+			// pushing every one of its planes back along its own normal, so the brush and the faces that were
+			// cut from it end up in the same place.
+			const Plane& p = planes[side.planenum];
+			const int planenum = planes.Find(p.normal, p.dist - Dot(p.normal, origin));
+
+			const MaterialInfo& mat = materials.Get(side.tex.material);
+			dbrushside_t bs;
+			bs.planenum = (uint16_t)planenum;
+			bs.texinfo = (int16_t)EmitTexInfo(out, side.tex, side.surfaceFlags,
+				out.AddTexData(side.tex.material, mat), -origin);
+			bs.dispinfo = -1;
+			bs.bevel = 0;
+			out.brushsides.push_back(bs);
+			db.numsides++;
+
+			for (const Vec3& pt : side.winding.points)
+			{
+				bounds.Add(pt - origin);
+			}
+		}
+		if (db.numsides == 0)
+		{
+			continue;
+		}
+
+		// EmitBrushes: the brush's own bounding planes are added as extra sides, so that sweeping a box
+		// against it rounds off its corners instead of catching on them. They sit on the bounding box and so
+		// never cut into the brush - a reader that ignores them sees the same shape.
+		Bounds brushBounds;
+		for (const Side& side : brush.sides)
+		{
+			for (const Vec3& pt : side.winding.points)
+			{
+				brushBounds.Add(pt - origin);
+			}
+		}
+		if (brushBounds.IsValid())
+		{
+			for (int axis = 0; axis < 3; ++axis)
+			{
+				for (int sign = -1; sign <= 1; sign += 2)
+				{
+					Vec3 normal;
+					normal[axis] = (double)sign;
+					const double dist = (sign == -1) ? -brushBounds.mins[axis] : brushBounds.maxs[axis];
+					const int planenum = planes.Find(normal, dist);
+					bool bAlreadyASide = false;
+					for (int j = 0; j < db.numsides && !bAlreadyASide; ++j)
+					{
+						bAlreadyASide = out.brushsides[(size_t)(db.firstside + j)].planenum == (uint16_t)planenum;
+					}
+					if (bAlreadyASide)
+					{
+						continue;
+					}
+					dbrushside_t bs = out.brushsides.back();
+					bs.planenum = (uint16_t)planenum;
+					// Flagged, unlike vbsp, which leaves the field holding whatever the last brush left there.
+					// A reader that skips bevels gets the brush; one that keeps them gets the same brush.
+					bs.bevel = 1;
+					out.brushsides.push_back(bs);
+					db.numsides++;
+				}
+			}
+		}
+
+		out.leafbrushes.push_back((uint16_t)out.brushes.size());
+		out.brushes.push_back(db);
+		leaf.contents |= db.contents;
+	}
+
+	leaf.numleafbrushes = (uint16_t)(out.leafbrushes.size() - leaf.firstleafbrush);
+	if (bounds.IsValid())
+	{
+		for (int i = 0; i < 3; ++i)
+		{
+			leaf.mins[i] = (int16_t)std::floor(bounds.mins[i]);
+			leaf.maxs[i] = (int16_t)std::ceil(bounds.maxs[i]);
+		}
+	}
+	model.headnode = -1 - (int32_t)out.leafs.size();
+	out.leafs.push_back(leaf);
+}
+
+dmodel_t EmitModel(LumpBuilder& out, std::vector<Brush>& brushes, PlanePool& planes,
 	MaterialCache& materials, const Vec3& origin, CompileStats& stats)
 {
 	dmodel_t model;
@@ -679,9 +808,7 @@ dmodel_t EmitModel(LumpBuilder& out, std::vector<Brush>& brushes, const PlanePoo
 		model.mins = dvec3_t(bounds.mins);
 		model.maxs = dvec3_t(bounds.maxs);
 	}
-	// headnode is -1 rather than a lie: LambdaBSP writes no BSP tree, and a reader that walks one must be told
-	// there is nothing to walk rather than being sent to node zero.
-	model.headnode = -1;
+	EmitModelBrushes(out, brushes, planes, materials, origin, model);
 	return model;
 }
 
@@ -898,15 +1025,6 @@ bool CompileMap(const CompileOptions& options, CompileStats& stats, std::string&
 
 	// ------------------------------------------------------------------ lumps
 	LumpBuilder out;
-	for (size_t i = 0; i < planes.Num(); ++i)
-	{
-		dplane_t p;
-		p.normal = dvec3_t(planes[(int)i].normal);
-		p.dist = (float)planes[(int)i].dist;
-		p.type = PlaneTypeForNormal(planes[(int)i].normal);
-		out.planes.push_back(p);
-	}
-
 	out.models.push_back(EmitModel(out, worldBrushes, planes, materials, Vec3(), stats));
 
 	// worldspawn advertises the extent of the level, the way vbsp writes it.
@@ -932,6 +1050,17 @@ bool CompileMap(const CompileOptions& options, CompileStats& stats, std::string&
 		entities.push_back(def);
 	}
 
+	// After the models, because moving a brush entity's brushes to sit around their own origin makes planes
+	// that nothing in the map file asked for.
+	for (size_t i = 0; i < planes.Num(); ++i)
+	{
+		dplane_t p;
+		p.normal = dvec3_t(planes[(int)i].normal);
+		p.dist = (float)planes[(int)i].dist;
+		p.type = PlaneTypeForNormal(planes[(int)i].normal);
+		out.planes.push_back(p);
+	}
+
 	stats.brushes = (int)worldBrushes.size();
 	for (const EntityDef& def : brushEntities)
 	{
@@ -942,6 +1071,12 @@ bool CompileMap(const CompileOptions& options, CompileStats& stats, std::string&
 	stats.materials = (int)out.texdatas.size();
 	stats.missingMaterials = materials.GetMissingCount();
 
+	if (out.leafbrushes.size() > 65535 || out.brushsides.size() > 65535)
+	{
+		outError = "too many brushes for the format; a leaf addresses them with 16 bits";
+		delete vmf;
+		return false;
+	}
 	if (out.vertexes.size() > 65535)
 	{
 		outError = "too many vertices for the format (" + std::to_string(out.vertexes.size())
@@ -964,8 +1099,11 @@ bool CompileMap(const CompileOptions& options, CompileStats& stats, std::string&
 	writer.SetLumpArray(LUMP_TEXDATA_STRING_TABLE, out.texdataStringTable);
 	writer.SetLumpBytes(LUMP_TEXDATA_STRING_DATA,
 		(const uint8_t*)out.texdataStringData.data(), out.texdataStringData.size());
-	// v20 leaves carry no ambient lighting of their own; the version says so even for an empty lump.
-	writer.SetLumpBytes(LUMP_LEAFS, nullptr, 0, 1);
+	writer.SetLumpArray(LUMP_BRUSHES, out.brushes);
+	writer.SetLumpArray(LUMP_BRUSHSIDES, out.brushsides);
+	writer.SetLumpArray(LUMP_LEAFBRUSHES, out.leafbrushes);
+	// v20 leaves carry no ambient lighting of their own, which is what the lump version says.
+	writer.SetLumpArray(LUMP_LEAFS, out.leafs, 1);
 
 	std::string writeError;
 	if (!writer.Write(options.bspPath, &writeError))
