@@ -645,7 +645,10 @@ dmodel_t EmitModel(LumpBuilder& out, std::vector<Brush>& brushes, const PlanePoo
 			}
 			// Faces that exist only to instruct the compiler never reach the renderer. NODRAW and SKY do,
 			// because the engine still wants them for collision and for the sky.
-			if (side.surfaceFlags & (SURF_SKIP | SURF_HINT | SURF_TRIGGER))
+			// SURF_TRIGGER is deliberately not in this list. Hint and skip describe nothing in the world, but
+			// a trigger volume's faces are the only shape the engine has to test against - Source can fall
+			// back on the brush model, this cannot.
+			if (side.surfaceFlags & (SURF_SKIP | SURF_HINT))
 			{
 				stats.facesCulledNoDraw += (int)side.fragments.size();
 				continue;
